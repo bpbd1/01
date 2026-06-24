@@ -1,1 +1,524 @@
 # 01
+import tkinter as tk
+from tkinter import scrolledtext, messagebox, ttk
+import threading
+import time
+import ssl
+import serial
+import serial.tools.list_ports  
+import ctypes
+from ctypes.util import find_library
+import queue
+import struct
+
+# Cek ketersediaan Opus Codec untuk encoding suara Mumble
+def cek_opus_sistem():
+    for nama_dll in ['opus', 'libopus', 'libopus-0', 'opus.dll', 'libopus-0.dll']:
+        try:
+            ctypes.CDLL(nama_dll)
+            return True
+        except:
+            continue
+    path_lib = find_library('opus')
+    if path_lib:
+        try:
+            ctypes.CDLL(path_lib)
+            return True
+        except: pass
+    return False
+
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_TERSEDIA = True
+except ImportError:
+    SOUNDDEVICE_TERSEDIA = False
+
+#  PATCH PENYELAMAT SSL
+if not hasattr(ssl, 'PROTOCOL_TLS'):
+    ssl.PROTOCOL_TLS = ssl.PROTOCOL_TLS_CLIENT
+
+if not hasattr(ssl, 'wrap_socket'):
+    def mumble_ssl_patch(sock, certfile=None, keyfile=None, ssl_version=None, **kwargs):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        if certfile:
+            context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        return context.wrap_socket(sock)
+    ssl.wrap_socket = mumble_ssl_patch
+
+import pymumble_py3 as pymumble
+
+class RoipGatewayApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("WWPTT to Server - Pure Digital Bridge")
+        self.root.geometry("520x780")  # Sedikit ditinggikan untuk space checkbox baru
+        self.root.configure(bg="#f0f2f5")
+
+        # Variabel Sistem Gateway
+        self.mumble = None
+        self.radio_serial = None
+        self.ptt_aktif = False
+        self.waktu_terakhir_suara = 0
+        self.is_running = False
+        self.antrean_rx = queue.Queue()
+        self.output_stream = None  
+        self.is_transmitting_mic = False
+        
+        self.pilihan_input_audio = []
+        self.pilihan_output_audio = []
+        self.pindai_perangkat_audio()
+
+        # =====================================================================
+        #  SISTEM TAB (NOTEBOOK)
+        # =====================================================================
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.tab_monitor = tk.Frame(self.notebook, bg="#f0f2f5")
+        self.tab_bridge = tk.Frame(self.notebook, bg="#f0f2f5")
+        self.tab_stop = tk.Frame(self.notebook, bg="#f0f2f5") 
+
+        self.notebook.add(self.tab_monitor, text="Monitor Jembatan")
+        self.notebook.add(self.tab_bridge, text="Seting Kabel Virtual")
+
+        # =====================================================================
+        #  TAB 1: MONITOR JEMBATAN
+        # =====================================================================
+        
+        # --- BUNDLE PANEL UTAMA ATAS (Pengaturan Koneksi + Tombol Bulat START) ---
+        self.frame_koneksi_induk = tk.Frame(self.tab_monitor, bg="#f0f2f5")
+        self.frame_koneksi_induk.pack(fill="x", padx=10, pady=5)
+
+        self.frame_input = tk.LabelFrame(self.frame_koneksi_induk, text=" Pengaturan Koneksi ", bg="#f0f2f5", font=("Arial", 10, "bold"), padx=10, pady=5)
+        self.frame_input.pack(side="left", fill="both", expand=True, padx=(0, 5))  
+
+        # Input Host/IP
+        tk.Label(self.frame_input, text="Host / IP Server:", bg="#f0f2f5").grid(row=0, column=0, sticky="w", pady=5)
+        self.ent_host = tk.Entry(self.frame_input, width=22)
+        self.ent_host.insert(0, "miswandi.my.id")
+        self.ent_host.grid(row=0, column=1, pady=5, padx=5)
+
+        # Input Nama Bot
+        tk.Label(self.frame_input, text="Nama Bot:", bg="#f0f2f5").grid(row=1, column=0, sticky="w", pady=5)
+        self.ent_user = tk.Entry(self.frame_input, width=22)
+        self.ent_user.insert(0, "Klien_Pemula_Keren")
+        self.ent_user.grid(row=1, column=1, pady=5, padx=5)
+
+        # Pilihan Dropdown Port USB Radio
+        tk.Label(self.frame_input, text="Port USB Radio:", bg="#f0f2f5").grid(row=2, column=0, sticky="w", pady=5)
+        self.cbo_com = ttk.Combobox(self.frame_input, width=19, state="readonly")
+        self.cbo_com.grid(row=2, column=1, pady=5, padx=5)
+
+        # --- TOMBOL BULAT START ---
+        self.canvas_start = tk.Canvas(self.frame_koneksi_induk, width=110, height=110, bg="#f0f2f5", highlightthickness=0)
+        self.canvas_start.pack(side="right", padx=10, pady=5)
+        
+        self.lingkaran_hijau = self.canvas_start.create_oval(5, 5, 105, 105, fill="#008000", outline="#004d00", width=2)
+        self.teks_start = self.canvas_start.create_text(55, 55, text="START", fill="white", font=("Arial", 14, "bold"))
+        
+        self.canvas_start.tag_bind(self.lingkaran_hijau, "<Button-1>", lambda e: self.toggle_gateway())
+        self.canvas_start.tag_bind(self.teks_start, "<Button-1>", lambda e: self.toggle_gateway())
+
+        # --- PANEL USER ONLINE ---
+        self.frame_users = tk.LabelFrame(self.tab_monitor, text=" 👥 User & Channel Online ", bg="#f0f2f5", font=("Arial", 10, "bold"), padx=10, pady=5)
+        self.frame_users.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self.list_users = tk.Listbox(self.frame_users, font=("Consolas", 10, "bold"), bg="#ffffff", fg="#2b2b2b", selectbackground="#007bff", highlightthickness=0)
+        self.list_users.pack(fill="both", expand=True, padx=2, pady=2)
+        self.list_users.bind("<Double-Button-1>", self.pindah_channel_klik)
+
+        # --- TOMBOL PTT MOUSE ---
+        self.btn_ptt = tk.Button(self.tab_monitor, text="⚪ TEKAN & TAHAN UNTUK BICARA (PTT)", bg="#6c757d", fg="white", font=("Arial", 11, "bold"), height=2, state=tk.DISABLED)
+        self.btn_ptt.pack(fill="x", padx=10, pady=5)
+        self.btn_ptt.bind("<ButtonPress-1>", self.mulai_bicara_mic)
+        self.btn_ptt.bind("<ButtonRelease-1>", self.selesai_bicara_mic)
+
+        # --- MONITOR AKTIVITAS ---
+        frame_log = tk.LabelFrame(self.tab_monitor, text=" Monitor Aktivitas Gateway ", bg="#f0f2f5", font=("Arial", 10, "bold"), padx=10, pady=5)
+        frame_log.pack(fill="x", padx=10, pady=5)
+
+        self.txt_log = scrolledtext.ScrolledText(frame_log, bg="black", fg="#00ff00", font=("Consolas", 9), height=8)
+        self.txt_log.pack(fill="both", expand=True)
+
+        # =====================================================================
+        #  KONTEN TAB DINAMIS STOP
+        # =====================================================================
+        lbl_stop_info = tk.Label(self.tab_stop, text="JEMBATAN PORT DIGITAL SEDANG BERJALAN AKTIF", font=("Arial", 11, "bold"), bg="#f0f2f5", fg="#dc3545")
+        lbl_stop_info.pack(pady=40)
+        
+        self.btn_stop_besar = tk.Button(self.tab_stop, text="PUTUSKAN KONEKSI (STOP)", bg="#dc3545", fg="white", font=("Arial", 12, "bold"), width=30, height=3, command=self.stop_gateway_backend)
+        self.btn_stop_besar.pack(pady=10)
+
+        # =====================================================================
+        #  TAB 2: SETING KABEL VIRTUAL & SAKLAR COS
+        # =====================================================================
+        lbl_title = tk.Label(self.tab_bridge, text="PENGATURAN DIGITAL BRIDGE", font=("Arial", 13, "bold"), bg="#f0f2f5", fg="#1a1a1a")
+        lbl_title.pack(pady=15)
+
+        frame_aud_in = tk.LabelFrame(self.tab_bridge, text=" 🔗 Audio Input (Dari Speaker HT ke PC) ", bg="#f0f2f5", font=("Arial", 9, "bold"), padx=10, pady=10)
+        frame_aud_in.pack(fill="x", padx=15, pady=8)
+        self.cbo_audio_in = ttk.Combobox(frame_aud_in, values=self.pilihan_input_audio, state="readonly", font=("Arial", 10))
+        self.cbo_audio_in.pack(fill="x")
+        if self.pilihan_input_audio: self.cbo_audio_in.current(0)
+
+        frame_aud_out = tk.LabelFrame(self.tab_bridge, text=" 🔊 Audio Output (Ke Mic Input HT) ", bg="#f0f2f5", font=("Arial", 9, "bold"), padx=10, pady=10)
+        frame_aud_out.pack(fill="x", padx=15, pady=8)
+        self.cbo_audio_out = ttk.Combobox(frame_aud_out, values=self.pilihan_output_audio, state="readonly", font=("Arial", 10))
+        self.cbo_audio_out.pack(fill="x")
+        if self.pilihan_output_audio: self.cbo_audio_out.current(0)
+
+        # --- PANEL UTAMA VOX & COS ---
+        frame_vox = tk.LabelFrame(self.tab_bridge, text=" 📊 Kontrol Otomatis Transmisi (RX HT -> Server) ", bg="#f0f2f5", font=("Arial", 9, "bold"), padx=10, pady=10)
+        frame_vox.pack(fill="x", padx=15, pady=8)
+        
+        # 1. Tombol On/Off Fitur COS/COR Hardware
+        self.var_cos_enabled = tk.BooleanVar(value=False) # Default OFF (masih pake VOX)
+        self.chk_cos = tk.Checkbutton(frame_vox, text="⚡ Gunakan Sinyal Hardware COS/COR (Pin CTS)", variable=self.var_cos_enabled, bg="#f0f2f5", font=("Arial", 10, "bold"), fg="#004d00", command=self.sinkronisasi_mode_rx)
+        self.chk_cos.pack(anchor="w", pady=5)
+
+        # Separator kecil
+        tk.Frame(frame_vox, height=2, bd=1, relief="groove", bg="#e0e0e0").pack(fill="x", pady=5)
+
+        # 2. Pengaturan VOX Otomatis (Hanya aktif jika COS tidak dicentang)
+        self.var_vox_enabled = tk.BooleanVar(value=True)
+        self.chk_vox = tk.Checkbutton(frame_vox, text="Aktifkan Transmisi VOX Otomatis (Sensor Suara)", variable=self.var_vox_enabled, bg="#f0f2f5", font=("Arial", 9))
+        self.chk_vox.pack(anchor="w", pady=2)
+
+        self.vox_meter = ttk.Progressbar(frame_vox, orient="horizontal", maximum=5000, mode="determinate")
+        self.vox_meter.pack(fill="x", pady=5)
+
+        self.var_vox_threshold = tk.IntVar(value=800)
+        self.vox_slider = tk.Scale(frame_vox, from_=0, to=5000, orient="horizontal", variable=self.var_vox_threshold, bg="#f0f2f5", highlightthickness=0)
+        self.vox_slider.pack(fill="x", pady=5)
+
+        # Jalankan pemindaian port COM hardware di awal
+        self.pindai_port_com_radio()
+        self.sinkronisasi_mode_rx()
+        self.write_log("💡 Aplikasi Siap. Klik tombol bulat START hijau untuk memulai.")
+
+    def sinkronisasi_mode_rx(self):
+        """Mengunci / membuka setting VOX berdasarkan saklar tombol COS"""
+        if self.var_cos_enabled.get():
+            self.chk_vox.config(state=tk.DISABLED)
+            self.vox_slider.config(state=tk.DISABLED, fg="gray")
+            self.write_log("⚙️ Mode RX berpindah ke: HARDWARE COS/COR (Mengabaikan VOX suara).")
+        else:
+            self.chk_vox.config(state=tk.NORMAL)
+            self.vox_slider.config(state=tk.NORMAL, fg="black")
+            self.write_log("⚙️ Mode RX berpindah ke: SOFTWARE VOX DIGITAL (Membaca volume suara).")
+
+    def pindai_port_com_radio(self):
+        ports = serial.tools.list_ports.comports()
+        daftar_com = []
+        for port in ports:
+            daftar_com.append(port.device)
+            
+        if daftar_com:
+            daftar_com.sort(key=lambda x: int(x.replace("COM", "")) if x.replace("COM", "").isdigit() else 0)
+            self.cbo_com['values'] = daftar_com
+            self.cbo_com.current(0)
+        else:
+            self.cbo_com['values'] = ["Tidak ada USB Radio"]
+            self.cbo_com.current(0)
+
+    def pindai_perangkat_audio(self):
+        if SOUNDDEVICE_TERSEDIA:
+            try:
+                perangkat = sd.query_devices()
+                for idx, dev in enumerate(perangkat):
+                    nama_bersih = f"{idx}: {dev['name']}"
+                    if dev['max_input_channels'] > 0: self.pilihan_input_audio.append(nama_bersih)
+                    if dev['max_output_channels'] > 0: self.pilihan_output_audio.append(nama_bersih)
+            except:
+                self.pilihan_input_audio = ["0: Gagal input"]
+                self.pilihan_output_audio = ["0: Gagal output"]
+        else:
+            self.pilihan_input_audio = ["❌ sounddevice hilang"]
+            self.pilihan_output_audio = ["❌ sounddevice hilang"]
+
+    def write_log(self, text):
+        def append():
+            self.txt_log.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {text}\n")
+            self.txt_log.see(tk.END)
+        self.root.after(0, append)
+
+    def ketika_suara_masuk(self, user, chunk):
+        self.antrean_rx.put((user, chunk))
+
+    def set_ui_terhubung(self):
+        self.frame_koneksi_induk.pack_forget()  
+        self.notebook.add(self.tab_stop, text="PUTUSKAN KONEKSI (STOP)")
+        
+        if cek_opus_sistem():
+            self.btn_ptt.config(state=tk.NORMAL, bg="#007bff")
+        else:
+            self.btn_ptt.config(state=tk.DISABLED, bg="#d39e00", text="⚠️ ERROR: OPUS.DLL HILANG")
+        self.loop_update_user_online()
+
+    def set_ui_terputus(self):
+        try: self.notebook.forget(self.tab_stop)
+        except: pass
+        
+        self.list_users.delete(0, tk.END)
+        
+        self.frame_koneksi_induk.pack(fill="x", padx=10, pady=5, before=self.frame_users)  
+        self.btn_ptt.config(state=tk.DISABLED, bg="#6c757d", text="⚪ TEKAN & TAHAN UNTUK BICARA (PTT)")
+        self.vox_meter.config(value=0)
+        self.pindai_port_com_radio()
+
+    def ketika_terhubung(self):
+        self.write_log(f"📢 Berhasil Handshake dengan Server Mumble!")
+
+    def ketika_terputus(self):
+        self.write_log("❌ Koneksi jembatan terputus dari server Mumble!")
+        self.is_running = False
+        self.root.after(0, self.set_ui_terputus)
+
+    def loop_update_user_online(self):
+        if self.is_running and self.mumble:
+            try:
+                posisi_y = self.list_users.yview()
+                seleksi_aktif = self.list_users.curselection()
+                
+                self.list_users.delete(0, tk.END)  
+                self.mapping_baris_channel = {}
+                
+                # 1. Channel Utama
+                self.list_users.insert(tk.END, "📁 MERAH PUTIH")
+                self.mapping_baris_channel[self.list_users.size() - 1] = 0
+                
+                for usr in sorted(list(self.mumble.users.values()), key=lambda x: x.get('name', '').lower()):
+                    if usr.get('channel_id') == 0 or usr.get('channel_id') is None:
+                        status_bicara = " [🗣️ TALKING]" if usr.get('talking', False) else ""
+                        self.list_users.insert(tk.END, f"   👤 {usr.get('name')}{status_bicara}")
+                
+                # 2. Sub-Channel
+                semua_channel = sorted(list(self.mumble.channels.values()), key=lambda x: x.get('position', x.get('channel_id', 0)))
+                for chan in semua_channel:
+                    c_id = chan.get('channel_id')
+                    c_nama = chan.get('name', '')
+                    if c_id == 0 or c_nama.lower() == "merah putih": continue
+                        
+                    self.list_users.insert(tk.END, f"📁 {c_nama.upper()}")
+                    self.mapping_baris_channel[self.list_users.size() - 1] = c_id
+                    
+                    for usr in sorted(list(self.mumble.users.values()), key=lambda x: x.get('name', '').lower()):
+                        if usr.get('channel_id') == c_id:
+                            status_bicara = " [🗣️ TALKING]" if usr.get('talking', False) else ""
+                            self.list_users.insert(tk.END, f"   👤 {usr.get('name')}{status_bicara}")
+                            
+                self.list_users.yview_moveto(posisi_y[0])
+                if seleksi_aktif: self.list_users.selection_set(seleksi_aktif[0])
+            except: pass
+            self.root.after(1000, self.loop_update_user_online)
+
+    def pindah_channel_klik(self, event):
+        if not self.is_running or not self.mumble: return
+        try:
+            indeks_terpilih = self.list_users.curselection()
+            if indeks_terpilih:
+                baris = indeks_terpilih[0]
+                if hasattr(self, 'mapping_baris_channel') and baris in self.mapping_baris_channel:
+                    target_channel_id = self.mapping_baris_channel[baris]
+                    session_saya = self.mumble.users.myself_session
+                    if target_channel_id in self.mumble.channels:
+                        self.mumble.channels[target_channel_id].move_in(session_saya)
+                        self.write_log(f"🔄 Bot berpindah ke Channel ID: {target_channel_id}")
+                    else:
+                        self.mumble.channels[0].move_in(session_saya)
+        except Exception as e:
+            self.write_log(f"❌ Gagal pindah channel: {e}")
+
+    def mulai_bicara_mic(self, event):
+        if not self.is_running or self.is_transmitting_mic: return
+        if not SOUNDDEVICE_TERSEDIA: return
+        self.is_transmitting_mic = True
+        self.btn_ptt.config(bg="#dc3545", text="🎙️ MEMAKSA TX... (LEPAS UNTUK STOP)")
+        threading.Thread(target=self.loop_kirim_suara_manual, daemon=True).start()
+
+    def selesai_bicara_mic(self, event):
+        if not self.is_transmitting_mic: return
+        self.is_transmitting_mic = False
+        self.btn_ptt.config(bg="#007bff", text="⚪ TEKAN & TAHAN UNTUK BICARA (PTT)")
+
+    def loop_kirim_suara_manual(self):
+        try:
+            try: idx_in = int(self.cbo_audio_in.get().split(":")[0])
+            except: idx_in = None
+            with sd.RawInputStream(device=idx_in, samplerate=48000, channels=1, dtype='int16', blocksize=960) as stream:
+                while self.is_transmitting_mic and self.is_running:
+                    data_suara, _ = stream.read(960)
+                    if self.mumble: self.mumble.sound_output.add_sound(bytes(data_suara))
+        except Exception as e: self.write_log(f"❌ Gagal PTT Manual: {e}")
+
+    def loop_vox_dan_cos_bridge(self, idx_input):
+        """Fungsi jembatan ganda: Bisa VOX Digital ataupun COS/COR Hardware"""
+        self.write_log("🎙️ Alur Pengawas Input Audio Jembatan Dimulai.")
+        try:
+            with sd.RawInputStream(device=idx_input, samplerate=48000, channels=1, dtype='int16', blocksize=960) as stream:
+                while self.is_running:
+                    data_suara, _ = stream.read(960)
+                    
+                    # 1. JALUR HARDWARE COS/COR (Pin CTS Aktif)
+                    if self.var_cos_enabled.get() and self.radio_serial:
+                        try:
+                            # Membaca pin CTS dari hardware USB serial
+                            cos_terdeteksi = self.radio_serial.getCTS()
+                        except:
+                            cos_terdeteksi = False
+                        
+                        if cos_terdeteksi:
+                            # Jika HT luar memancar, langsung tembak audio ke server tanpa peduli level volume
+                            if self.mumble: self.mumble.sound_output.add_sound(bytes(data_suara))
+                            self.root.after(0, lambda: self.vox_meter.config(value=5000)) # Penuhi bar indikator sebagai tanda TX aktif
+                        else:
+                            self.root.after(0, lambda: self.vox_meter.config(value=0))
+                    
+                    # 2. JALUR SOFTWARE VOX DIGITAL (Sensor Amplitudo Suara)
+                    else:
+                        sampel_audio = struct.unpack(f"{len(data_suara)//2}h", data_suara)
+                        nilai_puncak = max(abs(s) for s in sampel_audio) if sampel_audio else 0
+                        self.root.after(0, lambda v=nilai_puncak: self.vox_meter.config(value=v))
+                        
+                        if self.var_vox_enabled.get() and nilai_puncak >= self.var_vox_threshold.get():
+                            if self.mumble: self.mumble.sound_output.add_sound(bytes(data_suara))
+        except Exception as e: 
+            self.write_log(f"⚠️ Input Bridge Error: {e}")
+
+    def loop_terima_suara_mumble(self):
+        self.write_log("🔊 Jalur Output Jembatan (Server -> HT Out) Aktif.")
+        while self.is_running:
+            try:
+                user_obj, chunk = self.antrean_rx.get(timeout=0.1)
+                if self.radio_serial and not self.ptt_aktif:
+                    try:
+                        self.radio_serial.setRTS(True)
+                        self.ptt_aktif = True
+                    except: pass
+                self.waktu_terakhir_suara = time.time()
+                if self.output_stream and chunk.pcm:
+                    try: self.output_stream.write(chunk.pcm)
+                    except: pass
+            except queue.Empty: continue
+            except Exception as e: pass
+
+    def ptt_monitor_loop(self):
+        if self.is_running:
+            if self.ptt_aktif and (time.time() - self.waktu_terakhir_suara > 1.2):
+                if self.radio_serial:
+                    try: self.radio_serial.setRTS(False)
+                    except: pass
+                self.ptt_aktif = False
+            self.root.after(100, self.ptt_monitor_loop)
+
+    def start_gateway_backend(self):
+        host = self.ent_host.get()
+        port = 64738 
+        username = self.ent_user.get()
+        com_port = self.cbo_com.get()
+
+        if com_port == "Tidak ada USB Radio" or not com_port:
+            if self.var_cos_enabled.get():
+                self.root.after(0, lambda: messagebox.showerror("Error Hardware", "Anda mengaktifkan mode COS/COR Hardware, namun Port USB Radio COM tidak terdeteksi / tidak valid!"))
+                self.stop_gateway_backend()
+                return
+            com_port = None
+
+        try: idx_in = int(self.cbo_audio_in.get().split(":")[0])
+        except: idx_in = None
+        try: idx_out = int(self.cbo_audio_out.get().split(":")[0])
+        except: idx_out = None
+
+        if com_port:
+            try:
+                self.radio_serial = serial.Serial(com_port)
+                self.radio_serial.setRTS(False)
+                self.write_log(f"🔌 Hardware Serial terhubung di {com_port}")
+            except Exception as e: 
+                self.radio_serial = None
+                self.write_log(f"❌ Gagal membuka {com_port}: {e}")
+
+        if SOUNDDEVICE_TERSEDIA and idx_out is not None:
+            try:
+                self.output_stream = sd.RawOutputStream(device=idx_out, samplerate=48000, channels=1, dtype='int16')
+                self.output_stream.start()
+                self.write_log(f"🔊 Audio Out terarah ke index: {idx_out}")
+            except: self.output_stream = None
+
+        try:
+            self.write_log(f"⏳ Menyambungkan ke {host}:{port}...")
+            self.mumble = pymumble.Mumble(host, username, port=port)
+            
+            self.mumble.callbacks.set_callback(pymumble.constants.PYMUMBLE_CLBK_SOUNDRECEIVED, self.ketika_suara_masuk)
+            self.mumble.set_receive_sound(True)
+            self.mumble.callbacks.set_callback(pymumble.constants.PYMUMBLE_CLBK_CONNECTED, self.ketika_terhubung)
+            self.mumble.callbacks.set_callback(pymumble.constants.PYMUMBLE_CLBK_DISCONNECTED, self.ketika_terputus)
+            
+            self.mumble.start()
+            
+            self.write_log("⏳ Mengunduh daftar channel & user dari server..")
+            waktu_mulai = time.time()
+            while not self.mumble.is_ready():
+                time.sleep(0.2)
+                if time.time() - waktu_mulai > 10: break
+            
+            self.is_running = True
+            self.root.after(0, self.set_ui_terhubung)
+            
+            threading.Thread(target=self.loop_terima_suara_mumble, daemon=True).start()
+            if idx_in is not None and SOUNDDEVICE_TERSEDIA:
+                threading.Thread(target=self.loop_vox_dan_cos_bridge, args=(idx_in,), daemon=True).start()
+                
+            self.root.after(100, self.ptt_monitor_loop)
+            while self.is_running: time.sleep(1)
+        except Exception as e:
+            self.write_log(f"❌ System Crash: {e}")
+            self.stop_gateway_backend()
+
+    def stop_gateway_backend(self):
+        self.is_running = False
+        self.is_transmitting_mic = False
+        self.write_log("⏳ Memutus seluruh jembatan audio...")
+        
+        while not self.antrean_rx.empty():
+            try: self.antrean_rx.get_nowait()
+            except: break
+
+        if self.radio_serial:
+            try:
+                self.radio_serial.setRTS(False)
+                self.radio_serial.close()
+            except: pass
+            self.radio_serial = None
+
+        if self.output_stream:
+            try:
+                self.output_stream.stop()
+                self.output_stream.close()
+            except: pass
+            self.output_stream = None
+
+        if self.mumble:
+            try: self.mumble.stop()
+            except: pass
+            self.mumble = None
+
+        self.root.after(0, self.set_ui_terputus)
+        self.write_log("🏁 Bridge Berhasil Dinonaktifkan (Offline).")
+
+    def toggle_gateway(self):
+        if not self.is_running:
+            threading.Thread(target=self.start_gateway_backend, daemon=True).start()
+        else:
+            self.stop_gateway_backend()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = RoipGatewayApp(root)
+    def on_closing():
+        if app.is_running: app.stop_gateway_backend()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()
